@@ -1,0 +1,715 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>d20-night</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: #e9e6e0;
+    overflow: hidden;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+  }
+  #stage { position: fixed; inset: 0; cursor: pointer; outline: none; }
+  #stage canvas { display: block; width: 100%; height: 100%; }
+  #history {
+    position: fixed;
+    left: 50%;
+    bottom: clamp(18px, 4vh, 40px);
+    transform: translateX(-50%);
+    display: grid;
+    grid-template-columns: repeat(8, auto);
+    gap: clamp(6px, 1.2vmin, 10px);
+    pointer-events: none;
+  }
+  #history svg {
+    width: clamp(26px, 4.6vmin, 40px);
+    height: clamp(26px, 4.6vmin, 40px);
+    animation: ink-in .5s ease-out both;
+  }
+  @keyframes ink-in { from { opacity: 0; transform: scale(.85); } to { opacity: 1; transform: none; } }
+</style>
+</head>
+<body>
+<div id="stage" tabindex="0" role="button" aria-label="Toss the die"></div>
+<div id="history" aria-label="Recent tosses"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cannon.js/0.6.2/cannon.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(() => {
+  const CRIMSON = '#9e1b2a';
+  const stage = document.getElementById('stage');
+  const historyEl = document.getElementById('history');
+
+  function rng(seed) {
+    return () => { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; };
+  }
+
+  // =====================================================================
+  // Renderer / scene
+  // =====================================================================
+  const renderer = new THREE.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.outputEncoding = THREE.sRGBEncoding;
+  stage.appendChild(renderer.domElement);
+
+  const DUSK = 0xe9e6e0;                                            // pale open void
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(DUSK);
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 0.9;
+
+  const camera = new THREE.PerspectiveCamera(38, 1, 0.5, 3000);
+  camera.position.set(-15.5, 11, 15.5);
+  camera.lookAt(0, 0, 0);
+
+  // Orbit / zoom / pan. A quick click still tosses the die; a drag moves the view.
+  const controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 0, 0);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.minDistance = 5;
+  controls.maxDistance = 60;
+  controls.maxPolarAngle = Math.PI / 2 - 0.08;
+  controls.screenSpacePanning = false;
+  controls.update();
+
+  // Open, airy light: a soft studio key from upper left, bright pale ambient
+  scene.add(new THREE.HemisphereLight(0xfffaf2, 0xb8ac9a, 0.6));
+  const sun = new THREE.DirectionalLight(0xfff3e4, 1.25);
+  sun.position.set(-10, 13, -5);
+  sun.target.position.set(0, 0, 0.4);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  sun.shadow.radius = 6;
+  sun.shadow.bias = -0.0006;
+  sun.shadow.normalBias = 0.02;
+  Object.assign(sun.shadow.camera, { left: -12, right: 12, top: 12, bottom: -12, near: 1, far: 45 });
+  scene.add(sun, sun.target);
+  const fillLight = new THREE.DirectionalLight(0xe8eef8, 0.35);
+  fillLight.position.set(9, 6, 8);
+  scene.add(fillLight);
+
+  // Dust drifting in the air
+  const DUST = 500;
+  const dustGeo = new THREE.BufferGeometry();
+  const dustPos = new Float32Array(DUST * 3), dustBase = new Float32Array(DUST * 3), dustPhase = new Float32Array(DUST);
+  for (let i = 0; i < DUST; i++) {
+    dustBase[i * 3] = (Math.random() - 0.5) * 26;
+    dustBase[i * 3 + 1] = Math.random() * 9;
+    dustBase[i * 3 + 2] = (Math.random() - 0.5) * 22;
+    dustPhase[i] = Math.random() * Math.PI * 2;
+  }
+  dustPos.set(dustBase);
+  dustGeo.setAttribute('position', new THREE.BufferAttribute(dustPos, 3));
+  const dustTexCv = document.createElement('canvas'); dustTexCv.width = dustTexCv.height = 32;
+  (() => {
+    const c = dustTexCv.getContext('2d');
+    const g = c.createRadialGradient(16, 16, 0, 16, 16, 16);
+    g.addColorStop(0, 'rgba(255,255,255,1)'); g.addColorStop(0.4, 'rgba(255,255,255,0.5)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+    c.fillStyle = g; c.fillRect(0, 0, 32, 32);
+  })();
+  const dust = new THREE.Points(dustGeo, new THREE.PointsMaterial({
+    color: 0xffffff, size: 0.028, map: new THREE.CanvasTexture(dustTexCv),
+    transparent: true, opacity: 0.35, depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true,
+  }));
+  scene.add(dust);
+  function updateDust(t) {
+    for (let i = 0; i < DUST; i++) {
+      const ph = dustPhase[i], j = i * 3;
+      dustPos[j] = dustBase[j] + Math.sin(t * 0.21 + ph) * 0.3 + Math.sin(t * 0.07 + ph * 2.0) * 0.45;
+      dustPos[j + 1] = dustBase[j + 1] + Math.sin(t * 0.15 + ph) * 0.25 + Math.sin(t * 0.045 + ph * 1.7) * 0.4;
+      dustPos[j + 2] = dustBase[j + 2] + Math.cos(t * 0.18 + ph) * 0.3 + Math.cos(t * 0.05 + ph) * 0.45;
+    }
+    dustGeo.attributes.position.needsUpdate = true;
+  }
+
+  // Plain ground, stretching to the horizon
+  const floor = new THREE.Mesh(
+    new THREE.PlaneGeometry(4000, 4000),
+    new THREE.MeshStandardMaterial({ color: 0xbfb8ad, roughness: 1 })
+  );
+  floor.rotation.x = -Math.PI / 2;
+  floor.position.y = 0;
+  floor.receiveShadow = true;
+  scene.add(floor);
+
+  // Red-paint mandala on the ground. Each roll composes a fresh variation and
+  // draws it stroke by stroke, every line at its own pace.
+  const CHALK_S = 2048, CHALK_W = 26;
+  const CHALK_U = CHALK_S / CHALK_W;                                 // px per world unit
+
+  // A design is a list of strokes: polylines in canvas pixels with a width and alpha.
+  function composeChalk(seed) {
+    const rand = rng(seed);
+    const pick = arr => arr[Math.floor(rand() * arr.length)];
+    const between = (a, b) => a + rand() * (b - a);
+    const U = CHALK_U, rot = rand() < 0.35 ? Math.PI / 4 : 0;
+    const strokes = [];
+    const T = ([x, y]) => [
+      CHALK_S / 2 + (x * Math.cos(rot) - y * Math.sin(rot)) * U,
+      CHALK_S / 2 + (x * Math.sin(rot) + y * Math.cos(rot)) * U,
+    ];
+    const add = (pts, w, alpha = 0.75) => strokes.push({ pts: pts.map(T), w, alpha });
+    const circlePts = (r, n = 160, cx = 0, cy = 0) =>
+      Array.from({ length: n + 1 }, (_, i) => { const a = (i / n) * Math.PI * 2; return [cx + Math.cos(a) * r, cy + Math.sin(a) * r]; });
+    const rectPts = (x, y, w, h) => [[x, y], [x + w, y], [x + w, y + h], [x, y + h], [x, y]];
+    const polyPts = (n, r, ro = 0) =>
+      Array.from({ length: n + 1 }, (_, i) => { const a = ro + (i / n) * Math.PI * 2; return [Math.cos(a) * r, Math.sin(a) * r]; });
+    const quadPts = (a, c, b, n = 10) =>
+      Array.from({ length: n + 1 }, (_, i) => { const t = i / n, u = 1 - t;
+        return [u * u * a[0] + 2 * u * t * c[0] + t * t * b[0], u * u * a[1] + 2 * u * t * c[1] + t * t * b[1]]; });
+    const rotPts = (pts, k) => pts.map(([x, y]) => { const a = k * Math.PI / 2; return [x * Math.cos(a) - y * Math.sin(a), x * Math.sin(a) + y * Math.cos(a)]; });
+    const R0 = between(11.6, 12.4);                                  // outer rim
+
+    // Construction grid & diagonals (very faint)
+    add(rectPts(-R0, -R0, 2 * R0, 2 * R0), 4, 0.28);
+    const div = pick([3, 4, 5, 6]);
+    for (let i = -div; i <= div; i++) {
+      const t = i * R0 / div;
+      add([[t, -R0], [t, R0]], 3, 0.28);
+      add([[-R0, t], [R0, t]], 3, 0.28);
+    }
+    add([[-R0, -R0], [R0, R0]], 3, 0.28);
+    add([[R0, -R0], [-R0, R0]], 3, 0.28);
+    if (rand() < 0.5) { add(circlePts(R0), 3, 0.28); add(polyPts(pick([6, 8, 12]), R0, Math.PI / 8), 3, 0.28); }
+
+    // Perimeter rings
+    const rings = [R0, R0 - between(0.5, 0.8), R0 - between(1.4, 1.8), R0 - between(2.2, 2.6)];
+    rings.forEach((r, i) => add(circlePts(r), i % 3 === 0 ? 7 : 5));
+    // Lotus petals between the two inner rings
+    const petals = pick([32, 40, 48, 56, 64]), pr0 = rings[3], pr1 = rings[2] + 0.2;
+    for (let i = 0; i < petals; i++) {
+      const a0 = (i / petals) * Math.PI * 2, a1 = ((i + 1) / petals) * Math.PI * 2, am = (a0 + a1) / 2;
+      add(quadPts([Math.cos(a0) * pr0, Math.sin(a0) * pr0], [Math.cos(am) * pr1, Math.sin(am) * pr1], [Math.cos(a1) * pr0, Math.sin(a1) * pr0]), 4);
+    }
+    // Ring of small marks between the outer rings
+    const marks = pick([48, 64, 72, 96]), mr0 = rings[1] + 0.15, mr1 = rings[0] - 0.15;
+    const markStyle = pick(['tick', 'dot', 'flame']);
+    for (let i = 0; i < marks; i++) {
+      const a = (i / marks) * Math.PI * 2;
+      if (markStyle === 'dot') {
+        const rm = (mr0 + mr1) / 2;
+        add(circlePts(0.09, 12, Math.cos(a) * rm, Math.sin(a) * rm), 5);
+      } else if (markStyle === 'flame') {
+        const am = a + Math.PI / marks, a2 = a + 2 * Math.PI / marks;
+        add(quadPts([Math.cos(a) * mr0, Math.sin(a) * mr0], [Math.cos(am) * mr1 * 1.01, Math.sin(am) * mr1 * 1.01], [Math.cos(a2) * mr0, Math.sin(a2) * mr0]), 5);
+      } else {
+        add([[Math.cos(a) * mr0, Math.sin(a) * mr0], [Math.cos(a) * mr1, Math.sin(a) * mr1]], 5);
+      }
+    }
+
+    // Palace walls with gates on each side
+    const H = between(6.6, 7.6);
+    [[H, 7], [H - between(0.5, 0.7), 5], [H - between(1.2, 1.6), 5]].forEach(([h, w]) => add(rectPts(-h, -h, 2 * h, 2 * h), w));
+    const lintels = pick([2, 3, 4]), gateW = between(0.9, 1.3), arch = rand() < 0.7;
+    for (let k = 0; k < 4; k++) {
+      const y = -H;
+      add(rotPts(rectPts(-gateW, y - 1.3, 2 * gateW, 1.3), k), 6);
+      add(rotPts(rectPts(-gateW * 0.6, y - 1.3, 1.2 * gateW, 1.3), k), 6);
+      for (let l = 0; l < lintels; l++) {
+        const w = (2.0 - l * 0.45) * (gateW / 1.1), yy = y - (1.9 + l * 0.5);
+        add(rotPts(rectPts(-w, yy, 2 * w, 0.5), k), 6);
+      }
+      const top = y - (1.9 + lintels * 0.5);
+      if (arch) add(rotPts(Array.from({ length: 13 }, (_, i) => { const a = Math.PI + (i / 12) * Math.PI; return [Math.cos(a) * 0.6, top + Math.sin(a) * 0.6]; }), k), 6);
+      else add(rotPts([[-0.6, top], [0, top - 0.7], [0.6, top]], k), 6);
+    }
+
+    // Inner hub: a few nested shapes chosen at random
+    let r = H - between(2.4, 3.0);
+    const hubSteps = pick([2, 3, 4]);
+    for (let i = 0; i < hubSteps; i++) {
+      const kind = pick(['circle', 'diamond', 'lotus', 'poly']);
+      if (kind === 'circle') add(circlePts(r), 5);
+      else if (kind === 'diamond') add(polyPts(4, r * 0.72 * Math.SQRT2 * 0.72, 0), 5);
+      else if (kind === 'poly') add(polyPts(pick([6, 8, 12]), r), 5);
+      else {
+        const n = pick([8, 12, 16]);
+        for (let j = 0; j < n; j++) {
+          const a0 = (j / n) * Math.PI * 2, a1 = ((j + 1) / n) * Math.PI * 2, am = (a0 + a1) / 2;
+          add(quadPts([Math.cos(a0) * r * 0.78, Math.sin(a0) * r * 0.78], [Math.cos(am) * r * 1.08, Math.sin(am) * r * 1.08], [Math.cos(a1) * r * 0.78, Math.sin(a1) * r * 0.78]), 4);
+        }
+      }
+      r *= between(0.62, 0.78);
+    }
+    add(circlePts(Math.max(0.8, r)), 5);
+
+    // Timing: strokes start from the centre outward, each with its own pace
+    const total = 3400, lead = 2300, C = CHALK_S / 2;
+    let maxR = 0;
+    strokes.forEach(st => {
+      let len = 0, far = 0;
+      for (let k = 0; k < st.pts.length; k++) {
+        if (k) len += Math.hypot(st.pts[k][0] - st.pts[k - 1][0], st.pts[k][1] - st.pts[k - 1][1]);
+        far = Math.max(far, Math.hypot(st.pts[k][0] - C, st.pts[k][1] - C));
+      }
+      st.len = len; st.far = far;
+      maxR = Math.max(maxR, far);
+    });
+    strokes.forEach(st => {
+      st.start = (st.far / maxR) * lead + rand() * 260;
+      st.dur = Math.max(120, Math.min(total - st.start, (260 + st.len * 0.22) * between(0.6, 1.5)));
+    });
+    return strokes;
+  }
+
+  // Draw every stroke up to its current progress
+  function drawStrokes(c, strokes, elapsed) {
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    c.clearRect(0, 0, CHALK_S, CHALK_S);
+    c.strokeStyle = 'rgba(178,48,56,1)'; c.lineCap = 'round'; c.lineJoin = 'round';
+    let done = true;
+    for (const st of strokes) {
+      const t = elapsed === Infinity ? 1 : Math.min(Math.max((elapsed - st.start) / st.dur, 0), 1);
+      if (t <= 0) { done = false; continue; }
+      if (t < 1) done = false;
+      c.globalAlpha = st.alpha; c.lineWidth = st.w;
+      c.beginPath();
+      c.moveTo(st.pts[0][0], st.pts[0][1]);
+      if (t >= 1) {
+        for (let k = 1; k < st.pts.length; k++) c.lineTo(st.pts[k][0], st.pts[k][1]);
+      } else {
+        let remaining = st.len * (1 - Math.pow(1 - t, 2));         // eases out as the hand slows
+        for (let k = 1; k < st.pts.length && remaining > 0; k++) {
+          const [x0, y0] = st.pts[k - 1], [x1, y1] = st.pts[k];
+          const seg = Math.hypot(x1 - x0, y1 - y0);
+          if (seg <= remaining) { c.lineTo(x1, y1); remaining -= seg; }
+          else { const f = remaining / seg; c.lineTo(x0 + (x1 - x0) * f, y0 + (y1 - y0) * f); remaining = 0; }
+        }
+      }
+      c.stroke();
+    }
+    c.globalAlpha = 1;
+    return done;
+  }
+
+  // Worn-paint mask (the alpha map): fixed flecks scrubbed out of the lines
+  const wearCv = document.createElement('canvas'); wearCv.width = wearCv.height = CHALK_S;
+  (() => {
+    const c = wearCv.getContext('2d'), rand = rng(77);
+    c.fillStyle = '#fff'; c.fillRect(0, 0, CHALK_S, CHALK_S);
+    c.globalCompositeOperation = 'destination-out';
+    for (let i = 0; i < 16000; i++) {
+      const x = rand() * CHALK_S, y = rand() * CHALK_S, rr = 0.6 + rand() * 2.4;
+      c.globalAlpha = 0.2 + rand() * 0.5;
+      c.beginPath(); c.arc(x, y, rr, 0, Math.PI * 2); c.fill();
+    }
+  })();
+  const wearTex = new THREE.CanvasTexture(wearCv);
+
+  const chalkCv = document.createElement('canvas'); chalkCv.width = chalkCv.height = CHALK_S;
+  const chalkCtx = chalkCv.getContext('2d');
+  let chalkStrokes = composeChalk(5);
+  drawStrokes(chalkCtx, chalkStrokes, Infinity);
+  const chalkTex = new THREE.CanvasTexture(chalkCv);
+  chalkTex.encoding = THREE.sRGBEncoding;
+  chalkTex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  const CHALK_OPACITY = 0.45;
+  const chalk = new THREE.Mesh(
+    new THREE.PlaneGeometry(CHALK_W, CHALK_W),
+    new THREE.MeshStandardMaterial({ map: chalkTex, alphaMap: wearTex, transparent: true, opacity: CHALK_OPACITY, roughness: 1, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 })
+  );
+  chalk.rotation.x = -Math.PI / 2;
+  chalk.position.y = 0.005;
+  chalk.receiveShadow = true;
+  scene.add(chalk);
+
+  // Redraw sequence: the old drawing fades, then the new one is drawn line by line
+  let redraw = null;
+  function redrawChalk() {
+    redraw = { t0: performance.now(), swapped: false };
+  }
+  function updateChalk(now) {
+    if (!redraw) return;
+    const FADE = 450;
+    const e = now - redraw.t0;
+    if (e < FADE) {
+      chalk.material.opacity = CHALK_OPACITY * (1 - e / FADE);
+      return;
+    }
+    if (!redraw.swapped) {
+      chalkStrokes = composeChalk(Math.floor(Math.random() * 1e6));
+      chalk.material.opacity = CHALK_OPACITY;
+      redraw.swapped = true;
+    }
+    const done = drawStrokes(chalkCtx, chalkStrokes, e - FADE);
+    chalkTex.needsUpdate = true;
+    if (done) redraw = null;
+  }
+
+  // Soft studio environment so the glaze picks up reflections
+  const glazeEnv = (() => {
+    const cv = document.createElement('canvas'); cv.width = 512; cv.height = 256;
+    const c = cv.getContext('2d');
+    const g = c.createLinearGradient(0, 0, 0, 256);
+    g.addColorStop(0, '#f4f1ea'); g.addColorStop(0.5, '#d9d5cd'); g.addColorStop(1, '#8c857a');
+    c.fillStyle = g; c.fillRect(0, 0, 512, 256);
+    c.fillStyle = '#ffffff';
+    c.fillRect(60, 40, 120, 70); c.fillRect(330, 30, 90, 60);        // two soft "windows"
+    c.filter = 'blur(6px)'; c.drawImage(cv, 0, 0); c.filter = 'none';
+    const tex = new THREE.CanvasTexture(cv);
+    tex.mapping = THREE.EquirectangularReflectionMapping;
+    tex.encoding = THREE.sRGBEncoding;
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    const env = pmrem.fromEquirectangular(tex).texture;
+    pmrem.dispose(); tex.dispose();
+    return env;
+  })();
+
+  // =====================================================================
+  // Faience textures
+  // =====================================================================
+  const TEX = 384;
+  const UV = [[0.5, 0.95], [0.03, 0.13], [0.97, 0.13]];
+  const cu = (UV[0][0] + UV[1][0] + UV[2][0]) / 3, cvv = (UV[0][1] + UV[1][1] + UV[2][1]) / 3;
+  const cx = cu * TEX, cy = (1 - cvv) * TEX;
+
+  // Faience: turquoise glaze, mottled and speckled, worn pale at the corners
+  function makeFaience(seed) {
+    const rand = rng(seed);
+    const color = document.createElement('canvas');
+    const bump = document.createElement('canvas');
+    const rough = document.createElement('canvas');
+    color.width = color.height = bump.width = bump.height = rough.width = rough.height = TEX;
+    const c = color.getContext('2d');
+    const b = bump.getContext('2d');
+    const r = rough.getContext('2d');
+
+    // Base glaze, a little deeper toward the middle of the face
+    const g = c.createRadialGradient(cx, cy, 10, cx, cy, TEX * 0.7);
+    g.addColorStop(0, `hsl(${glazeHue}, 40%, 39%)`);
+    g.addColorStop(1, `hsl(${glazeHue + 4}, 36%, 46%)`);
+    c.fillStyle = g; c.fillRect(0, 0, TEX, TEX);
+    b.fillStyle = '#808080'; b.fillRect(0, 0, TEX, TEX);
+    r.fillStyle = '#4a4a4a'; r.fillRect(0, 0, TEX, TEX);          // glossy overall
+
+    // Mottled pooling of the glaze: greens, blues, a few olive patches
+    const pools = ['rgba(46,122,100,0.45)', 'rgba(92,168,142,0.4)', 'rgba(120,190,160,0.3)', 'rgba(60,140,150,0.3)', 'rgba(110,150,90,0.25)'];
+    for (let i = 0; i < 140; i++) {
+      const x = rand() * TEX, y = rand() * TEX, rr = 8 + rand() * 40;
+      const gg = c.createRadialGradient(x, y, 0, x, y, rr);
+      gg.addColorStop(0, pools[Math.floor(rand() * pools.length)]);
+      gg.addColorStop(1, 'rgba(0,0,0,0)');
+      c.fillStyle = gg; c.beginPath(); c.arc(x, y, rr, 0, Math.PI * 2); c.fill();
+      const rg = r.createRadialGradient(x, y, 0, x, y, rr);
+      rg.addColorStop(0, rand() > 0.5 ? 'rgba(255,255,255,0.18)' : 'rgba(0,0,0,0.18)');
+      rg.addColorStop(1, 'rgba(0,0,0,0)');
+      r.fillStyle = rg; r.beginPath(); r.arc(x, y, rr, 0, Math.PI * 2); r.fill();
+    }
+    // Worn, thinner glaze toward the three corners, showing the pale body
+    UV.forEach(([u, v]) => {
+      const x = u * TEX, y = (1 - v) * TEX;
+      const gg = c.createRadialGradient(x, y, 0, x, y, TEX * 0.26);
+      gg.addColorStop(0, 'rgba(214,206,170,0.55)');
+      gg.addColorStop(0.5, 'rgba(160,190,160,0.2)');
+      gg.addColorStop(1, 'rgba(0,0,0,0)');
+      c.fillStyle = gg; c.fillRect(0, 0, TEX, TEX);
+      const rg = r.createRadialGradient(x, y, 0, x, y, TEX * 0.22);
+      rg.addColorStop(0, 'rgba(255,255,255,0.5)'); rg.addColorStop(1, 'rgba(0,0,0,0)');
+      r.fillStyle = rg; r.fillRect(0, 0, TEX, TEX);                // worn body is matte
+    });
+    // Dark speckles in the glaze and tiny pale pinholes
+    for (let i = 0; i < 420; i++) {
+      const x = rand() * TEX, y = rand() * TEX, rr = 0.4 + rand() * 1.6;
+      c.fillStyle = rand() > 0.1 ? `rgba(20,50,40,${0.25 + rand() * 0.4})` : `rgba(225,232,220,${0.12 + rand() * 0.18})`;
+      c.beginPath(); c.arc(x, y, rr, 0, Math.PI * 2); c.fill();
+      b.fillStyle = 'rgba(0,0,0,0.45)';
+      b.beginPath(); b.arc(x, y, rr * 0.8, 0, Math.PI * 2); b.fill();
+    }
+    // Fine crazing cracks in the glaze
+    b.strokeStyle = 'rgba(0,0,0,0.35)'; b.lineWidth = 0.8;
+    c.strokeStyle = 'rgba(20,45,40,0.18)'; c.lineWidth = 0.8;
+    for (let i = 0; i < 70; i++) {
+      let x = rand() * TEX, y = rand() * TEX;
+      const steps = 3 + Math.floor(rand() * 5);
+      c.beginPath(); c.moveTo(x, y); b.beginPath(); b.moveTo(x, y);
+      for (let k = 0; k < steps; k++) {
+        x += (rand() - 0.5) * 30; y += (rand() - 0.5) * 30;
+        c.lineTo(x, y); b.lineTo(x, y);
+      }
+      c.stroke(); b.stroke();
+    }
+    // Grain
+    const img = c.getImageData(0, 0, TEX, TEX);
+    const bimg = b.getImageData(0, 0, TEX, TEX);
+    for (let i = 0; i < img.data.length; i += 4) {
+      const n = (rand() - 0.5) * 9;
+      img.data[i] += n; img.data[i + 1] += n; img.data[i + 2] += n;
+      const bn = (rand() - 0.5) * 8;
+      bimg.data[i] += bn; bimg.data[i + 1] += bn; bimg.data[i + 2] += bn;
+    }
+    c.putImageData(img, 0, 0);
+    b.putImageData(bimg, 0, 0);
+    return { color, bump, rough, c, b };
+  }
+
+  // A number carved into the face and filled with crimson paint
+  function carveNumber(c, b, label) {
+    const size = label.length > 1 ? TEX * 0.19 : TEX * 0.26;
+    const font = `700 ${size}px "Trebuchet MS", "Gill Sans", "Helvetica Neue", Arial, sans-serif`;
+    const y = cy + size * 0.04;
+    [c, b].forEach(ctx => { ctx.font = font; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; });
+    // deepest shade, paint, lit lip of the cut
+    c.fillStyle = 'rgba(92,10,20,0.6)'; c.fillText(label, cx - 1.2, y - 1.2);
+    c.fillStyle = 'rgba(158,27,42,0.94)'; c.fillText(label, cx, y);
+    c.lineWidth = Math.max(1.5, size * 0.04);
+    c.strokeStyle = 'rgba(225,240,230,0.45)'; c.strokeText(label, cx + size * 0.025, y + size * 0.025);
+    c.strokeStyle = 'rgba(70,8,16,0.5)'; c.strokeText(label, cx - size * 0.012, y - size * 0.012);
+    // 9 gets an underline so it reads the right way up
+    if (label === '9') { c.fillStyle = 'rgba(158,27,42,0.94)'; c.fillRect(cx - size * 0.26, y + size * 0.5, size * 0.52, size * 0.07); }
+    b.fillStyle = 'rgba(0,0,0,0.9)';
+    b.filter = 'blur(1.2px)';
+    b.fillText(label, cx, y);
+    if (label === '9') b.fillRect(cx - size * 0.26, y + size * 0.5, size * 0.52, size * 0.07);
+    b.filter = 'none';
+  }
+
+  function makeFaceMaterial(label, seed) {
+    const { color, bump, rough, c, b } = makeFaience(seed);
+    carveNumber(c, b, label);
+    const map = new THREE.CanvasTexture(color);
+    map.encoding = THREE.sRGBEncoding;
+    map.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    const bumpMap = new THREE.CanvasTexture(bump);
+    const roughnessMap = new THREE.CanvasTexture(rough);
+    return new THREE.MeshStandardMaterial({
+      map, bumpMap, bumpScale: 0.015, roughnessMap, roughness: 1, metalness: 0,
+      envMap: glazeEnv, envMapIntensity: 0.9,
+    });
+  }
+
+  // =====================================================================
+  // Icosahedron (20 faces): visual mesh + physics hull from the same faces
+  // =====================================================================
+  const DIE_R = 1.0;
+  const ico = new THREE.IcosahedronGeometry(DIE_R, 0);
+  const pos = ico.getAttribute('position');
+  const faces = [];
+  for (let i = 0; i < pos.count; i += 3) {
+    let tri = [0, 1, 2].map(k => new THREE.Vector3().fromBufferAttribute(pos, i + k));
+    const n = tri[1].clone().sub(tri[0]).cross(tri[2].clone().sub(tri[0]));
+    if (n.dot(tri[0]) < 0) tri = [tri[0], tri[2], tri[1]];
+    faces.push(tri);
+  }
+  ico.dispose();
+  const R = faces[0][0].length();
+  const INFLATE = 0.12;
+  const inflate = p => p.lerp(p.clone().normalize().multiplyScalar(R * 0.95), INFLATE);
+  const faceNormals = faces.map(f => f[0].clone().add(f[1]).add(f[2]).normalize());
+
+  const N = 14;
+  const positions = [], uvs = [], indices = [];
+  const geo = new THREE.BufferGeometry();
+  faces.forEach(([A, B, C], fi) => {
+    const base = positions.length / 3;
+    const rowStart = [];
+    let count = 0;
+    for (let i = 0; i <= N; i++) {
+      rowStart.push(count);
+      for (let j = 0; j <= N - i; j++) {
+        const u = i / N, v = j / N;
+        const p = inflate(A.clone()
+          .add(B.clone().sub(A).multiplyScalar(u))
+          .add(C.clone().sub(A).multiplyScalar(v)));
+        positions.push(p.x, p.y, p.z);
+        uvs.push(
+          UV[0][0] + (UV[1][0] - UV[0][0]) * u + (UV[2][0] - UV[0][0]) * v,
+          UV[0][1] + (UV[1][1] - UV[0][1]) * u + (UV[2][1] - UV[0][1]) * v
+        );
+        count++;
+      }
+    }
+    const start = indices.length;
+    const idx = (i, j) => base + rowStart[i] + j;
+    for (let i = 0; i < N; i++) {
+      for (let j = 0; j < N - i; j++) {
+        indices.push(idx(i, j), idx(i + 1, j), idx(i, j + 1));
+        if (j < N - i - 1) indices.push(idx(i + 1, j), idx(i + 1, j + 1), idx(i, j + 1));
+      }
+    }
+    geo.addGroup(start, indices.length - start, fi);
+  });
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+
+  const glazeHue = 162;                                              // one glaze colour for every die
+  const LABELS = ['4.5', '9'];
+  function buildMaterials(seed) {
+    // shuffle which faces carry which number, keeping ten of each
+    const kinds = faces.map((_, i) => LABELS[i % 2]);
+    const rand = rng(seed);
+    for (let i = kinds.length - 1; i > 0; i--) {
+      const j = Math.floor(rand() * (i + 1)); [kinds[i], kinds[j]] = [kinds[j], kinds[i]];
+    }
+    return { kinds, materials: kinds.map((k, i) => makeFaceMaterial(k, seed + i * 977)) };
+  }
+
+  // ---- Physics world ----
+  const world = new CANNON.World();
+  world.gravity.set(0, -42, 0);
+  world.broadphase = new CANNON.NaiveBroadphase();
+  world.solver.iterations = 20;
+  world.allowSleep = true;
+  const rugPhys = new CANNON.Material('rug');
+  const diePhys = new CANNON.Material('die');
+  world.addContactMaterial(new CANNON.ContactMaterial(rugPhys, diePhys, { friction: 0.55, restitution: 0.28 }));
+
+  function addStaticPlane(x, y, z, axis, angle) {
+    const body = new CANNON.Body({ mass: 0, material: rugPhys });
+    body.addShape(new CANNON.Plane());
+    body.position.set(x, y, z);
+    body.quaternion.setFromAxisAngle(new CANNON.Vec3(...axis), angle);
+    world.addBody(body);
+  }
+  addStaticPlane(0, 0, 0, [1, 0, 0], -Math.PI / 2);                 // rug surface
+  const WX = 4.2, WZ = 6.2;                                         // invisible walls keep the dice in view
+  addStaticPlane(WX, 0, 0, [0, 1, 0], -Math.PI / 2);
+  addStaticPlane(-WX, 0, 0, [0, 1, 0], Math.PI / 2);
+  addStaticPlane(0, 0, WZ, [0, 1, 0], Math.PI);
+  addStaticPlane(0, 0, -WZ, [0, 1, 0], 0);
+
+  // Convex hull from the unique icosahedron vertices
+  const vkey = v => `${v.x.toFixed(4)},${v.y.toFixed(4)},${v.z.toFixed(4)}`;
+  const vmap = new Map(), hullVerts = [], hullFaces = [];
+  faces.forEach(tri => hullFaces.push(tri.map(v => {
+    const k = vkey(v);
+    if (!vmap.has(k)) { vmap.set(k, hullVerts.length); hullVerts.push(new CANNON.Vec3(v.x, v.y, v.z)); }
+    return vmap.get(k);
+  })));
+  const hull = new CANNON.ConvexPolyhedron(hullVerts, hullFaces);
+  // Every rolled die stays on the rug; only the newest one reports a result
+  const dice = [];
+  const MAX_DICE = 60;
+  const tmpN = new THREE.Vector3(), tmpQ = new THREE.Quaternion();
+  function faceUp(body) {
+    tmpQ.set(body.quaternion.x, body.quaternion.y, body.quaternion.z, body.quaternion.w);
+    let best = 0, bestY = -Infinity;
+    faceNormals.forEach((n, i) => {
+      tmpN.copy(n).applyQuaternion(tmpQ);
+      if (tmpN.y > bestY) { bestY = tmpN.y; best = i; }
+    });
+    return best;
+  }
+  function spawnDie(seed) {
+    const { kinds, materials } = buildMaterials(seed);
+    const mesh = new THREE.Mesh(geo, materials);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    scene.add(mesh);
+    const body = new CANNON.Body({
+      mass: 1, material: diePhys, shape: hull,
+      allowSleep: true, sleepSpeedLimit: 0.35, sleepTimeLimit: 0.4,
+      linearDamping: 0.08, angularDamping: 0.12,
+    });
+    world.addBody(body);
+    const d = { mesh, body, kinds, armed: false };
+    body.addEventListener('sleep', () => {
+      if (!d.armed) return;
+      d.armed = false;
+      finish(d.kinds[faceUp(body)]);
+    });
+    dice.push(d);
+    if (dice.length > MAX_DICE) removeDie(dice.shift());
+    return d;
+  }
+  function removeDie(d) {
+    scene.remove(d.mesh);
+    world.removeBody(d.body);
+    d.mesh.material.forEach(m => { m.map.dispose(); m.bumpMap.dispose(); m.roughnessMap.dispose(); m.dispose(); });
+  }
+
+  // Result tiles drawn in the same red chalk as the ground: grainy, slightly wobbly strokes
+  const CHALK_RED = '#b23038';
+  function tile(label) {
+    const seed = Math.floor(Math.random() * 1000);
+    return `<svg viewBox="0 0 48 48" aria-label="${label}">
+      <filter id="ch${seed}" x="-15%" y="-15%" width="130%" height="130%">
+        <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="3" seed="${seed}" result="grain"/>
+        <feColorMatrix in="grain" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 2.6 -0.75" result="grainA"/>
+        <feComposite in="SourceGraphic" in2="grainA" operator="in" result="dusty"/>
+        <feTurbulence type="fractalNoise" baseFrequency="0.07" numOctaves="2" seed="${seed + 1}" result="warp"/>
+        <feDisplacementMap in="dusty" in2="warp" scale="2.2" xChannelSelector="R" yChannelSelector="G"/>
+      </filter>
+      <g filter="url(#ch${seed})" fill="none" stroke="${CHALK_RED}" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="3" width="42" height="42" rx="8" stroke-width="2.2"/>
+        <text x="24" y="25" text-anchor="middle" dominant-baseline="central" fill="${CHALK_RED}" stroke="none"
+          font-family="'Trebuchet MS','Gill Sans','Helvetica Neue',Arial,sans-serif" font-weight="700"
+          font-size="${label.length > 1 ? 17 : 22}">${label}</text>
+      </g></svg>`;
+  }
+  function finish(kind) {
+    historyEl.insertAdjacentHTML('afterbegin', tile(kind));
+    while (historyEl.children.length > 8) historyEl.lastChild.remove();
+  }
+
+  // Each click drops a brand-new die from above; the earlier ones stay where they landed
+  function toss() {
+    const d = spawnDie(Math.floor(Math.random() * 1e6));
+    const { body } = d;
+    const a = Math.random() * Math.PI * 2, rr = Math.random() * 1.6;
+    body.position.set(Math.cos(a) * rr, 7 + Math.random() * 2, Math.sin(a) * rr);
+    const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(
+      Math.random() * Math.PI * 2, Math.random() * Math.PI * 2, Math.random() * Math.PI * 2));
+    body.quaternion.set(q.x, q.y, q.z, q.w);
+    body.velocity.set((Math.random() - 0.5) * 3, -4 - Math.random() * 4, (Math.random() - 0.5) * 3);
+    body.angularVelocity.set(
+      (Math.random() - 0.5) * 24, (Math.random() - 0.5) * 24, (Math.random() - 0.5) * 24
+    );
+    d.armed = true;
+    // a falling die can nudge sleeping neighbours awake
+    dice.forEach(o => { if (o !== d) o.body.wakeUp(); });
+    redrawChalk();
+  }
+
+  // ---- Loop ----
+  let last = performance.now();
+  function update(now) {
+    const dt = Math.min((now - last) / 1000, 0.05);
+    last = now;
+    world.step(1 / 120, dt, 6);
+    controls.update();
+    updateDust(now / 1000);
+    updateChalk(now);
+    dice.forEach(({ mesh, body }) => { mesh.position.copy(body.position); mesh.quaternion.copy(body.quaternion); });
+    renderer.render(scene, camera);
+    requestAnimationFrame(update);
+  }
+
+  function resize() {
+    const w = stage.clientWidth, h = stage.clientHeight;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h;
+    camera.fov = w / h < 0.8 ? 58 : w / h < 1.3 ? 46 : 38;
+    camera.updateProjectionMatrix();
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // Click (no drag) tosses; drag orbits/pans via OrbitControls
+  let down = null;
+  stage.addEventListener('pointerdown', e => { down = { x: e.clientX, y: e.clientY, t: performance.now() }; });
+  stage.addEventListener('pointerup', e => {
+    if (!down) return;
+    const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y);
+    if (moved < 6 && performance.now() - down.t < 400) toss();
+    down = null;
+  });
+  window.addEventListener('keydown', e => {
+    if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); toss(); }
+  });
+
+  requestAnimationFrame(update);
+})();
+</script>
+</body>
+</html>
