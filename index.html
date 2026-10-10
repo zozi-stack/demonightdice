@@ -30,12 +30,38 @@
     height: clamp(26px, 4.6vmin, 40px);
     animation: ink-in .5s ease-out both;
   }
+  #power {
+    position: fixed;
+    top: clamp(14px, 3vmin, 28px);
+    right: clamp(14px, 3vmin, 28px);
+    width: 44px; height: 44px; padding: 9px;
+    border: 1px solid rgba(46,42,39,0.55);
+    border-radius: 12px;
+    background: transparent;
+    color: #2e2a27;
+    cursor: pointer;
+    opacity: 0.75;
+    transition: opacity .2s, background .2s;
+  }
+  #power:hover { opacity: 1; background: rgba(46,42,39,0.06); }
+  #power svg { width: 100%; height: 100%; display: block; }
+  #power .slash { display: none; stroke: #9e1b2a; stroke-width: 2; }
+  #power[aria-pressed="false"] { opacity: 0.55; }
+  #power[aria-pressed="false"] .slash { display: block; }
   @keyframes ink-in { from { opacity: 0; transform: scale(.85); } to { opacity: 1; transform: none; } }
 </style>
 </head>
 <body>
 <div id="stage" tabindex="0" role="button" aria-label="Toss the die"></div>
 <div id="history" aria-label="Recent tosses"></div>
+<button id="power" aria-label="Switch carpet on" aria-pressed="false" title="Switch carpet on">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round">
+    <rect x="4" y="3" width="16" height="18" rx="1"/>
+    <rect x="7" y="6" width="10" height="12" rx="0.5"/>
+    <path d="M4 7h3M4 12h3M4 17h3M17 7h3M17 12h3M17 17h3"/>
+    <line class="slash" x1="4" y1="20" x2="20" y2="4"/>
+  </svg>
+</button>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/cannon.js/0.6.2/cannon.min.js"></script>
@@ -48,6 +74,215 @@
 
   function rng(seed) {
     return () => { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; };
+  }
+
+  // =====================================================================
+  // Tibetan carpet texture (procedural)
+  // =====================================================================
+  const P = {
+    dark: '#2e2a27', cream: '#e3d8bf', red: '#b5362c', teal: '#6e8e8c',
+    brown: '#8b5a3b', blue: '#9db4bb', rust: '#c4563a', white: '#f3eee0',
+  };
+  const RUG_W = 10;
+  const CW = 1024, CH = 1440;                     // one repeat of the runner
+  const RUG_L = RUG_W * CH / CW;                  // world length of one repeat
+
+  function drawRosette(c, x, y, r, inner, petal, n = 8) {
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI * 2;
+      c.fillStyle = petal; c.strokeStyle = P.dark; c.lineWidth = Math.max(1.5, r * 0.06);
+      c.beginPath(); c.arc(x + Math.cos(a) * r * 0.62, y + Math.sin(a) * r * 0.62, r * 0.34, 0, Math.PI * 2);
+      c.fill(); c.stroke();
+    }
+    c.fillStyle = inner; c.strokeStyle = P.dark;
+    c.beginPath(); c.arc(x, y, r * 0.36, 0, Math.PI * 2); c.fill(); c.stroke();
+    c.fillStyle = P.dark;
+    c.beginPath(); c.arc(x, y, r * 0.1, 0, Math.PI * 2); c.fill();
+  }
+  function drawLozenge(c, x, y, s, fill, stroke = P.dark) {
+    c.fillStyle = fill; c.strokeStyle = stroke; c.lineWidth = Math.max(1.5, s * 0.1);
+    c.beginPath();
+    c.moveTo(x, y - s); c.lineTo(x + s * 0.6, y - s * 0.4); c.lineTo(x + s * 0.6, y + s * 0.4);
+    c.lineTo(x, y + s); c.lineTo(x - s * 0.6, y + s * 0.4); c.lineTo(x - s * 0.6, y - s * 0.4);
+    c.closePath(); c.fill(); c.stroke();
+    c.fillStyle = stroke; c.beginPath(); c.arc(x, y, s * 0.18, 0, Math.PI * 2); c.fill();
+  }
+
+  // Runs fn once for each long side with a transform where local x runs the
+  // full height of the tile and local y points inward from `inset`.
+  function eachSide(c, inset, bandH, fn) {
+    [
+      { tx: CW - inset, ty: 0, rot: Math.PI / 2 },
+      { tx: inset, ty: CH, rot: -Math.PI / 2 },
+    ].forEach(s => {
+      c.save(); c.translate(s.tx, s.ty); c.rotate(s.rot);
+      fn(CH, bandH);
+      c.restore();
+    });
+  }
+
+  function drawMeander(c, len, h) {
+    const pad = h * 0.09, tiles = Math.max(1, Math.round(len / h)), tw = len / tiles;
+    const sx = (tw - 2 * pad) / 7, sy = (h - 2 * pad) / 7;
+    c.strokeStyle = P.dark; c.lineWidth = Math.min(sx, sy) * 0.95; c.lineCap = 'butt'; c.lineJoin = 'miter';
+    const hook = [[6.5, 0.5], [6.5, 6.5], [1.5, 6.5], [1.5, 2.5], [4.5, 2.5], [4.5, 4.5], [3.2, 4.5]];
+    for (let i = 0; i < tiles; i++) {
+      c.save(); c.translate(i * tw + pad, pad);
+      c.beginPath(); c.moveTo(-pad, 0.5 * sy); c.lineTo(tw - pad, 0.5 * sy); c.stroke();
+      c.beginPath(); hook.forEach(([x, y], k) => k ? c.lineTo(x * sx, y * sy) : c.moveTo(x * sx, y * sy)); c.stroke();
+      c.restore();
+    }
+  }
+
+  function drawMotifBand(c, len, h, rand) {
+    const tiles = Math.max(2, 2 * Math.round(len / (h * 0.95) / 2)), tw = len / tiles;
+    const combos = [[P.cream, P.red], [P.blue, P.dark], [P.white, P.brown], [P.cream, P.teal]];
+    for (let i = 0; i < tiles; i++) {
+      const x = i * tw + tw / 2, y = h / 2;
+      if (i % 2 === 0) {
+        const [inner, petal] = combos[Math.floor(rand() * combos.length)];
+        drawRosette(c, x, y, h * 0.3, inner, petal);
+      } else {
+        drawLozenge(c, x, y, h * 0.22, rand() > 0.5 ? P.teal : P.rust);
+        // little stems and dots around the lozenge
+        c.strokeStyle = P.dark; c.lineWidth = 2;
+        c.beginPath(); c.moveTo(x, y - h * 0.22); c.lineTo(x, y - h * 0.4); c.stroke();
+        c.beginPath(); c.moveTo(x, y + h * 0.22); c.lineTo(x, y + h * 0.4); c.stroke();
+        c.fillStyle = P.red;
+        c.beginPath(); c.arc(x, y - h * 0.42, 4, 0, Math.PI * 2); c.fill();
+        c.beginPath(); c.arc(x, y + h * 0.42, 4, 0, Math.PI * 2); c.fill();
+      }
+    }
+  }
+
+  function drawMedallion(c, x, y, R) {
+    // Lobed outline
+    c.save(); c.translate(x, y);
+    const lobes = 14;
+    c.beginPath();
+    for (let i = 0; i <= 360; i++) {
+      const a = (i / 360) * Math.PI * 2;
+      const r = R * (0.95 + 0.05 * Math.cos(a * lobes));
+      i ? c.lineTo(Math.cos(a) * r, Math.sin(a) * r) : c.moveTo(Math.cos(a) * r, Math.sin(a) * r);
+    }
+    c.closePath();
+    c.fillStyle = P.cream; c.fill();
+    c.strokeStyle = P.dark; c.lineWidth = 5; c.stroke();
+    c.strokeStyle = P.red; c.lineWidth = 2;
+    c.beginPath(); c.arc(0, 0, R * 0.84, 0, Math.PI * 2); c.stroke();
+    // Four dark wings + brown/teal petals
+    for (let k = 0; k < 4; k++) {
+      c.save(); c.rotate(k * Math.PI / 2);
+      c.fillStyle = P.dark;
+      c.beginPath(); c.ellipse(0, -R * 0.5, R * 0.3, R * 0.19, 0, 0, Math.PI * 2); c.fill();
+      c.fillStyle = P.cream;
+      c.beginPath(); c.ellipse(0, -R * 0.56, R * 0.09, R * 0.05, 0, 0, Math.PI * 2); c.fill();
+      c.rotate(Math.PI / 4);
+      c.fillStyle = P.brown; c.strokeStyle = P.dark; c.lineWidth = 2.5;
+      c.beginPath(); c.ellipse(0, -R * 0.55, R * 0.16, R * 0.2, 0, 0, Math.PI * 2); c.fill(); c.stroke();
+      c.fillStyle = P.teal;
+      c.beginPath(); c.arc(0, -R * 0.3, R * 0.1, 0, Math.PI * 2); c.fill(); c.stroke();
+      c.restore();
+    }
+    // Centre square
+    c.fillStyle = P.teal; c.fillRect(-R * 0.16, -R * 0.16, R * 0.32, R * 0.32);
+    c.fillStyle = P.red; c.fillRect(-R * 0.1, -R * 0.1, R * 0.2, R * 0.2);
+    c.fillStyle = P.dark; c.fillRect(-R * 0.04, -R * 0.04, R * 0.08, R * 0.08);
+    c.restore();
+  }
+
+  function drawSpray(c, x, y, flip) {
+    c.save(); c.translate(x, y); c.scale(1, flip ? -1 : 1);
+    c.strokeStyle = P.dark; c.lineWidth = 3; c.lineCap = 'round';
+    // stems
+    c.beginPath(); c.moveTo(0, 110); c.lineTo(0, 20); c.stroke();
+    c.beginPath(); c.moveTo(0, 70); c.lineTo(-60, 45); c.stroke();
+    c.beginPath(); c.moveTo(0, 85); c.lineTo(58, 60); c.stroke();
+    // leaves
+    c.fillStyle = P.teal;
+    [[-25, 95, -0.6], [22, 100, 0.6], [-40, 60, -0.3], [35, 75, 0.4]].forEach(([lx, ly, a]) => {
+      c.beginPath(); c.ellipse(lx, ly, 14, 6, a, 0, Math.PI * 2); c.fill();
+    });
+    // blossoms
+    drawRosette(c, 0, 0, 40, P.cream, P.red);
+    drawRosette(c, -62, 42, 24, P.white, P.rust, 6);
+    drawLozenge(c, 60, 58, 22, P.blue);
+    c.fillStyle = P.dark;
+    [[-18, 125], [18, 125]].forEach(([dx, dy]) => { c.beginPath(); c.arc(dx, dy, 4, 0, Math.PI * 2); c.fill(); });
+    c.restore();
+  }
+
+  function makeCarpet() {
+    const rand = rng(7);
+    const cv = document.createElement('canvas');
+    cv.width = CW; cv.height = CH;
+    const c = cv.getContext('2d');
+
+    // Outer dark selvedge
+    c.fillStyle = P.dark; c.fillRect(0, 0, CW, CH);
+    // Cream ground for the two border bands
+    const b0 = 44;
+    c.fillStyle = P.cream; c.fillRect(b0, 0, CW - 2 * b0, CH);
+    // Meander band
+    const mInset = 54, mH = 68;
+    eachSide(c, mInset, mH, (len, h) => drawMeander(c, len, h));
+    // Thin divider
+    const d1 = mInset + mH + 6;
+    c.fillStyle = P.dark;
+    c.fillRect(d1 - 3, 0, 6, CH); c.fillRect(CW - d1 - 3, 0, 6, CH);
+    // Motif band
+    const fInset = d1 + 8, fH = 100;
+    eachSide(c, fInset, fH, (len, h) => drawMotifBand(c, len, h, rand));
+    // Inner dark guard with white dashes
+    const g0 = fInset + fH + 6, gH = 22;
+    c.fillStyle = P.dark;
+    c.fillRect(g0, 0, gH, CH); c.fillRect(CW - g0 - gH, 0, gH, CH);
+    c.strokeStyle = P.white; c.lineWidth = 5; c.setLineDash([9, 11]);
+    [g0 + gH / 2, CW - g0 - gH / 2].forEach(x => { c.beginPath(); c.moveTo(x, 0); c.lineTo(x, CH); c.stroke(); });
+    c.setLineDash([]);
+    // Red field
+    const f0 = g0 + gH;
+    c.fillStyle = P.red; c.fillRect(f0, 0, CW - 2 * f0, CH);
+    const fg = c.createLinearGradient(f0, 0, CW - f0, 0);
+    fg.addColorStop(0, 'rgba(60,10,10,0.16)'); fg.addColorStop(0.5, 'rgba(255,120,90,0.08)'); fg.addColorStop(1, 'rgba(60,10,10,0.16)');
+    c.fillStyle = fg; c.fillRect(f0, 0, CW - 2 * f0, CH);
+
+    drawMedallion(c, CW / 2, CH / 2, 230);
+    // Sprays sit midway between medallions, so they straddle the tile seam
+    [-CH / 2, CH / 2].forEach(off => {
+      drawSpray(c, CW / 2 - 165, CH / 2 + off + 150, true);
+      drawSpray(c, CW / 2 + 165, CH / 2 + off + 150, true);
+      drawSpray(c, CW / 2 - 165, CH / 2 + off - 150, false);
+      drawSpray(c, CW / 2 + 165, CH / 2 + off - 150, false);
+    });
+    [[f0 + 70, CH / 4], [CW - f0 - 70, CH / 4], [f0 + 70, CH * 3 / 4], [CW - f0 - 70, CH * 3 / 4]]
+      .forEach(([x, y]) => drawLozenge(c, x, y, 16, P.blue, P.cream));
+
+    // Weave: knot grid + fibre noise
+    const img = c.getImageData(0, 0, CW, CH), d = img.data;
+    for (let y = 0; y < CH; y++) {
+      const row = (y & 2) ? 2 : -2;
+      for (let x = 0; x < CW; x++) {
+        const i = (y * CW + x) * 4;
+        const knot = ((x & 2) ? 2 : -2) + row;
+        const n = (rand() - 0.5) * 10 + knot;
+        d[i] += n; d[i + 1] += n; d[i + 2] += n;
+      }
+    }
+    c.putImageData(img, 0, 0);
+
+    // Bump map: knot relief
+    const bw = 512, bh = Math.round(bw * RUG_L / RUG_W);
+    const bc = document.createElement('canvas'); bc.width = bw; bc.height = bh;
+    const bctx = bc.getContext('2d');
+    const bimg = bctx.createImageData(bw, bh);
+    for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+      const i = (y * bw + x) * 4;
+      const v = 128 + 22 * Math.sin(x * Math.PI / 4) * Math.sin(y * Math.PI / 4) + (rand() - 0.5) * 14;
+      bimg.data[i] = bimg.data[i + 1] = bimg.data[i + 2] = v; bimg.data[i + 3] = 255;
+    }
+    bctx.putImageData(bimg, 0, 0);
+    return { color: cv, bump: bc };
   }
 
   // =====================================================================
@@ -137,7 +372,7 @@
     new THREE.MeshStandardMaterial({ color: 0xbfb8ad, roughness: 1 })
   );
   floor.rotation.x = -Math.PI / 2;
-  floor.position.y = 0;
+  floor.position.y = -0.14;
   floor.receiveShadow = true;
   scene.add(floor);
 
@@ -318,7 +553,7 @@
     new THREE.MeshStandardMaterial({ map: chalkTex, alphaMap: wearTex, transparent: true, opacity: CHALK_OPACITY, roughness: 1, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 })
   );
   chalk.rotation.x = -Math.PI / 2;
-  chalk.position.y = 0.005;
+  chalk.position.y = -0.135;
   chalk.receiveShadow = true;
   scene.add(chalk);
 
@@ -344,6 +579,31 @@
     chalkTex.needsUpdate = true;
     if (done) redraw = null;
   }
+
+  // Rug: a thin box, patterned on top, fringe on the ends
+  const carpet = makeCarpet();
+  const RUG_LEN = 4000;
+  const carpetMap = new THREE.CanvasTexture(carpet.color);
+  carpetMap.encoding = THREE.sRGBEncoding;
+  carpetMap.wrapT = THREE.RepeatWrapping;
+  carpetMap.repeat.set(1, RUG_LEN / RUG_L);
+  carpetMap.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  const carpetBump = new THREE.CanvasTexture(carpet.bump);
+  carpetBump.wrapT = THREE.RepeatWrapping;
+  carpetBump.repeat.set(1, RUG_LEN / RUG_L);
+  carpetBump.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  const topMat = new THREE.MeshStandardMaterial({ map: carpetMap, bumpMap: carpetBump, bumpScale: 0.005, roughness: 0.95 });
+  const sideMat = new THREE.MeshStandardMaterial({ color: 0x2e2a27, roughness: 1 });
+  const fringeMat = new THREE.MeshStandardMaterial({ color: 0xd9cfb8, roughness: 1 });
+  const RUG_T = 0.14;
+  const rug = new THREE.Mesh(
+    new THREE.BoxGeometry(RUG_W, RUG_T, RUG_LEN),
+    [sideMat, sideMat, topMat, sideMat, fringeMat, fringeMat]
+  );
+  rug.position.y = -RUG_T / 2;
+  rug.receiveShadow = true;
+  rug.castShadow = true;
+  scene.add(rug);
 
   // Soft studio environment so the glaze picks up reflections
   const glazeEnv = (() => {
@@ -572,7 +832,7 @@
     world.addBody(body);
   }
   addStaticPlane(0, 0, 0, [1, 0, 0], -Math.PI / 2);                 // rug surface
-  const WX = 4.2, WZ = 6.2;                                         // invisible walls keep the dice in view
+  const WX = RUG_W / 2 - 0.8, WZ = 6.2;                 // invisible walls keep the die on the rug
   addStaticPlane(WX, 0, 0, [0, 1, 0], -Math.PI / 2);
   addStaticPlane(-WX, 0, 0, [0, 1, 0], Math.PI / 2);
   addStaticPlane(0, 0, WZ, [0, 1, 0], Math.PI);
@@ -651,6 +911,24 @@
     historyEl.insertAdjacentHTML('afterbegin', tile(kind));
     while (historyEl.children.length > 8) historyEl.lastChild.remove();
   }
+
+  // Carpet switch: off hides the runner and the dice land on the bare ground
+  const powerBtn = document.getElementById('power');
+  let carpetOn = true;
+  function setCarpet(on) {
+    carpetOn = on;
+    powerBtn.setAttribute('aria-pressed', on);
+    powerBtn.setAttribute('aria-label', on ? 'Switch carpet off' : 'Switch carpet on');
+    powerBtn.title = on ? 'Switch carpet off' : 'Switch carpet on';
+    rug.visible = on;
+    // the ground rises to meet the dice when the rug is gone
+    floor.position.y = on ? -RUG_T : 0;
+    chalk.position.y = on ? -RUG_T + 0.005 : 0.005;
+    dice.forEach(d => d.body.wakeUp());
+  }
+  setCarpet(false);
+  powerBtn.addEventListener('click', e => { e.stopPropagation(); setCarpet(!carpetOn); });
+  powerBtn.addEventListener('pointerdown', e => e.stopPropagation());
 
   // Each click drops a brand-new die from above; the earlier ones stay where they landed
   function toss() {
